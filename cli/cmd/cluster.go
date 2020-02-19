@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	servicemirror "github.com/linkerd/linkerd2/controller/cmd/service-mirror"
-
 	v1 "k8s.io/api/rbac/v1"
 
 	"github.com/linkerd/linkerd2/pkg/k8s"
@@ -20,10 +18,11 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
+const tokenKey = "token"
+
 type getCredentialsOptions struct {
 	namespace      string
 	serviceAccount string
-	apiEndpoint    string
 	clusterName    string
 }
 
@@ -37,19 +36,19 @@ func newCmdCluster() *cobra.Command {
 	createOpts := createOptions{}
 
 	clusterCmd := &cobra.Command{
-		Use:   "cluster",
-		Short: "Set up cross-cluster access",
+		Use:   "cluster manages the multicluster  setup for Linkerd",
+		Short: "cluster manages the multicluster  setup for Linkerd",
 		Args:  cobra.NoArgs,
 	}
 
 	createCredentalsCommand := &cobra.Command{
-		Use:   "create-credentials",
-		Short: "Create the necessary credentials for service mirroring",
-		Args:  cobra.NoArgs,
+		Use: "create-credentials", Short: "Create the necessary credentialsfor service mirroring",
+
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 
 			labels := map[string]string{
-				k8s.ControllerComponentLabel: "mirror",
+				k8s.ControllerComponentLabel: k8s.ServiceMirrorLabel,
 				k8s.ControllerNSLabel:        controlPlaneNamespace,
 			}
 
@@ -67,7 +66,7 @@ func newCmdCluster() *cobra.Command {
 
 			svcAccount := corev1.ServiceAccount{
 				ObjectMeta: metav1.ObjectMeta{Name: createOpts.serviceAccount, Namespace: controlPlaneNamespace, Labels: labels},
-				TypeMeta:   metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"},
+				TypeMeta:   metav1.TypeMeta{Kind: v1.ServiceAccountKind, APIVersion: "v1"},
 			}
 
 			clusterRoleBinding := v1.ClusterRoleBinding{
@@ -103,25 +102,26 @@ func newCmdCluster() *cobra.Command {
 		Short: "Get cluster credentials as a secret",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-
 			rules := clientcmd.NewDefaultClientConfigLoadingRules()
 			rules.ExplicitPath = kubeconfigPath
-			overrides := &clientcmd.ConfigOverrides{CurrentContext: kubeContext}
-			loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)
-
+			loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
 			config, err := loader.RawConfig()
 			if err != nil {
 				return err
 			}
 
-			k, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, []string{}, 0)
+			if kubeContext != "" {
+				config.CurrentContext = kubeContext
+			}
+
+			k, err := k8s.NewAPI(kubeconfigPath, config.CurrentContext, impersonate, impersonateGroup, 0)
 			if err != nil {
 				return err
 			}
 
 			sa, err := k.CoreV1().ServiceAccounts(getOpts.namespace).Get(getOpts.serviceAccount, metav1.GetOptions{})
 			if err != nil {
-				return nil
+				return err
 			}
 
 			var secretName string
@@ -132,7 +132,7 @@ func newCmdCluster() *cobra.Command {
 				}
 			}
 			if secretName == "" {
-				return fmt.Errorf("Could not find service account token secret for %s", sa.Name)
+				return fmt.Errorf("could not find service account token secret for %s", sa.Name)
 			}
 
 			secret, err := k.CoreV1().Secrets(getOpts.namespace).Get(secretName, metav1.GetOptions{})
@@ -140,9 +140,16 @@ func newCmdCluster() *cobra.Command {
 				return err
 			}
 
-			token := secret.Data["token"]
+			token, ok := secret.Data[tokenKey]
+			if !ok {
+				return fmt.Errorf("could not find the token data in the service account secret")
+			}
 
-			context := config.Contexts[kubeContext]
+			context, ok := config.Contexts[config.CurrentContext]
+			if !ok {
+				return fmt.Errorf("could not extract current context from config")
+			}
+
 			context.AuthInfo = getOpts.serviceAccount
 			config.Contexts = map[string]*api.Context{
 				config.CurrentContext: context,
@@ -155,11 +162,6 @@ func newCmdCluster() *cobra.Command {
 
 			cluster := config.Clusters[context.Cluster]
 
-			if getOpts.apiEndpoint != "" {
-				port := strings.Split(cluster.Server, ":")[2]
-				cluster.Server = fmt.Sprintf("https://%s:%s", getOpts.apiEndpoint, port)
-			}
-
 			config.Clusters = map[string]*api.Cluster{
 				context.Cluster: cluster,
 			}
@@ -170,17 +172,17 @@ func newCmdCluster() *cobra.Command {
 			}
 
 			creds := corev1.Secret{
-				Type:     servicemirror.MirrorSecretType,
+				Type:     k8s.MirrorSecretType,
 				TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      fmt.Sprintf("cluster-credentials-%s", getOpts.clusterName),
 					Namespace: controlPlaneNamespace,
 					Annotations: map[string]string{
-						servicemirror.RemoteClusterNameLabel: getOpts.clusterName,
+						k8s.RemoteClusterNameLabel: getOpts.clusterName,
 					},
 				},
 				Data: map[string][]byte{
-					servicemirror.ConfigKeyName: kubeconfig,
+					k8s.ConfigKeyName: kubeconfig,
 				},
 			}
 
@@ -195,10 +197,9 @@ func newCmdCluster() *cobra.Command {
 	}
 
 	getCredentialsCmd.Flags().StringVar(&getOpts.serviceAccount, "service-account", "linkerd-mirror", "service account")
-	getCredentialsCmd.Flags().StringVar(&getOpts.apiEndpoint, "api-endpoint", "", "api endpoint")
 	getCredentialsCmd.Flags().StringVarP(&getOpts.namespace, "namespace", "n", "linkerd", "service account namespace")
 	getCredentialsCmd.Flags().StringVar(&getOpts.clusterName, "cluster-name", "remote", "cluster name")
-	createCredentalsCommand.Flags().StringVar(&createOpts.serviceAccount, "service-account", "linkerd-mirror", "service account")
+	createCredentalsCommand.Flags().StringVar(&createOpts.serviceAccount, "service-account", "linkerd-mirror", "the name of the service account used")
 
 	clusterCmd.AddCommand(getCredentialsCmd)
 	clusterCmd.AddCommand(createCredentalsCommand)

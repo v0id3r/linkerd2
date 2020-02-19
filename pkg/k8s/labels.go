@@ -354,6 +354,9 @@ const (
 	// ConfigKeyName is the key in the secret that stores the kubeconfig needed to connect
 	// to a remote cluster
 	ConfigKeyName = "kubeconfig"
+
+	// ServiceMirrorLabel is the value used in the controller component label
+	ServiceMirrorLabel = "servicemirror"
 )
 
 // CreatedByAnnotationValue returns the value associated with
